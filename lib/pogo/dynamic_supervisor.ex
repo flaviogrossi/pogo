@@ -216,11 +216,7 @@ defmodule Pogo.DynamicSupervisor do
       cond do
         assigned_node == Node.self() ->
           unless supervising?(scope, child_spec) do
-            {:ok, pid} = Supervisor.start_child(supervisor, child_spec)
-
-            track_supervisor(scope, child_spec)
-            track_pid(scope, child_spec, pid)
-            track_spec(scope, child_spec)
+            do_start_child(scope, supervisor, child_spec)
           end
 
           complete_request(scope, request)
@@ -275,11 +271,7 @@ defmodule Pogo.DynamicSupervisor do
           # start it here, if it's not started yet and it's not being terminated
 
           unless terminating?(scope, id) || supervising?(scope, child_spec) do
-            {:ok, pid} = Supervisor.start_child(supervisor, child_spec)
-
-            track_supervisor(scope, child_spec)
-            track_pid(scope, child_spec, pid)
-            track_spec(scope, child_spec)
+            do_start_child(scope, supervisor, child_spec)
           end
 
         _ ->
@@ -294,6 +286,18 @@ defmodule Pogo.DynamicSupervisor do
             untrack_supervisor(scope, child_spec)
           end
       end
+    end
+  end
+
+  defp do_start_child(scope, supervisor, child_spec) do
+    case Supervisor.start_child(supervisor, child_spec) do
+      {:ok, pid} ->
+        track_supervisor(scope, child_spec)
+        track_pid(scope, child_spec, pid)
+        track_spec(scope, child_spec)
+
+      _ ->
+        nil
     end
   end
 
