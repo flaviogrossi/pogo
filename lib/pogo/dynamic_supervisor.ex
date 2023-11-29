@@ -104,6 +104,7 @@ defmodule Pogo.DynamicSupervisor do
 
   @impl true
   def init(opts) do
+    Process.flag(:trap_exit, true)
     scope = Keyword.fetch!(opts, :scope)
     {sync_interval, opts} = Keyword.pop(opts, :sync_interval, @sync_interval)
     {children, opts} = Keyword.pop(opts, :children, [])
@@ -195,6 +196,17 @@ defmodule Pogo.DynamicSupervisor do
 
     Process.send_after(self(), :sync, sync_interval)
 
+    {:noreply, state}
+  end
+
+  def handle_info({:EXIT, supervisor, _reason}, %{supervisor: supervisor} = state) do
+    opts = [strategy: :one_for_one]
+    {:ok, supervisor} = Supervisor.start_link([], opts)
+
+    {:noreply, %{state | supervisor: supervisor}}
+  end
+
+  def handle_info({:EXIT, _, _reason}, state) do
     {:noreply, state}
   end
 
@@ -299,7 +311,8 @@ defmodule Pogo.DynamicSupervisor do
           # child is assigned to current node
           # start it here, if it's not started yet and it's not being terminated
 
-          unless terminating?(scope, id) || supervising?(scope, child_spec) do
+          unless terminating?(scope, id) ||
+                   (supervising?(scope, child_spec) && alive?(scope, child_spec)) do
             do_start_child(scope, supervisor, child_spec)
           end
 
@@ -321,9 +334,15 @@ defmodule Pogo.DynamicSupervisor do
   defp do_start_child(scope, supervisor, child_spec) do
     case Supervisor.start_child(supervisor, child_spec) do
       {:ok, pid} ->
+        %{id: id} = child_spec
+
         track_supervisor(scope, child_spec)
         track_pid(scope, child_spec, pid)
         track_spec(scope, child_spec)
+
+        if {:terminating, id} in :pg.which_groups(scope) do
+          finish_terminate(scope, id)
+        end
 
       _ ->
         nil
