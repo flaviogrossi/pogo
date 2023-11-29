@@ -298,8 +298,8 @@ defmodule Pogo.DynamicSupervisorTest do
     # assert no dangling start_child or terminate_child requests
     refute groups
            |> Enum.any?(fn
-             {{:start_child, _}, _} -> true
-             {{:terminate_child, _}, _} -> true
+             {{:start_child, _, _}, _} -> true
+             {{:terminate_child, _, _}, _} -> true
              _ -> false
            end)
 
