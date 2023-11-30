@@ -39,7 +39,7 @@ defmodule Pogo.DynamicSupervisor do
 
   @sync_interval 5_000
 
-  defstruct [:scope, :supervisor, :sync_interval]
+  defstruct [:scope, :supervisor, :sync_interval, :request_id]
 
   @doc """
   Starts local supervisor and joins cluster-wide scoped process group.
@@ -104,6 +104,7 @@ defmodule Pogo.DynamicSupervisor do
 
   @impl true
   def init(opts) do
+    Process.flag(:trap_exit, true)
     scope = Keyword.fetch!(opts, :scope)
     {sync_interval, opts} = Keyword.pop(opts, :sync_interval, @sync_interval)
     {children, opts} = Keyword.pop(opts, :children, [])
@@ -118,7 +119,8 @@ defmodule Pogo.DynamicSupervisor do
     state = %__MODULE__{
       scope: scope,
       supervisor: supervisor,
-      sync_interval: sync_interval
+      sync_interval: sync_interval,
+      request_id: 0
     }
 
     Process.send_after(self(), :sync, sync_interval)
@@ -127,14 +129,21 @@ defmodule Pogo.DynamicSupervisor do
   end
 
   @impl true
-  def handle_continue({:start_children, children}, %{scope: scope} = state) do
-    for child_spec <- children do
-      child_spec = Supervisor.child_spec(child_spec, [])
-      :ok = validate_child(child_spec)
-      make_request(scope, {:start_child, child_spec})
-    end
+  def handle_continue(
+        {:start_children, children},
+        %{request_id: request_id, scope: scope} = state
+      ) do
+    request_id =
+      Enum.reduce(children, request_id, fn child_spec, request_id ->
+        request_id = request_id + 1
+        child_spec = Supervisor.child_spec(child_spec, [])
+        :ok = validate_child(child_spec)
+        make_request(scope, {:start_child, child_spec, request_id})
 
-    {:noreply, state}
+        request_id
+      end)
+
+    {:noreply, %{state | request_id: request_id}}
   end
 
   @impl true
@@ -158,14 +167,18 @@ defmodule Pogo.DynamicSupervisor do
   end
 
   @impl true
-  def handle_cast({:start_child, child_spec}, %{scope: scope} = state) do
-    make_request(scope, {:start_child, child_spec})
-    {:noreply, state}
+  def handle_cast({:start_child, child_spec}, %{scope: scope, request_id: request_id} = state) do
+    request_id = request_id + 1
+    make_request(scope, {:start_child, child_spec, request_id})
+
+    {:noreply, %{state | request_id: request_id}}
   end
 
-  def handle_cast({:terminate_child, id}, %{scope: scope} = state) do
-    make_request(scope, {:terminate_child, id})
-    {:noreply, state}
+  def handle_cast({:terminate_child, id}, %{scope: scope, request_id: request_id} = state) do
+    request_id = request_id + 1
+    make_request(scope, {:terminate_child, id, request_id})
+
+    {:noreply, %{state | request_id: request_id}}
   end
 
   @impl true
@@ -175,8 +188,7 @@ defmodule Pogo.DynamicSupervisor do
       ) do
     ring = node_ring(scope)
 
-    process_start_child_requests(scope, supervisor, ring)
-    process_terminate_child_requests(scope, supervisor, ring)
+    process_requests(scope, supervisor, ring)
     distribute_children(scope, supervisor, ring)
     sync_local_children(scope, supervisor)
     sync_specs(scope)
@@ -184,6 +196,17 @@ defmodule Pogo.DynamicSupervisor do
 
     Process.send_after(self(), :sync, sync_interval)
 
+    {:noreply, state}
+  end
+
+  def handle_info({:EXIT, supervisor, _reason}, %{supervisor: supervisor} = state) do
+    opts = [strategy: :one_for_one]
+    {:ok, supervisor} = Supervisor.start_link([], opts)
+
+    {:noreply, %{state | supervisor: supervisor}}
+  end
+
+  def handle_info({:EXIT, _, _reason}, state) do
     {:noreply, state}
   end
 
@@ -209,53 +232,71 @@ defmodule Pogo.DynamicSupervisor do
     {assigned_node, assigned_supervisor}
   end
 
-  defp process_start_child_requests(scope, supervisor, ring) do
-    for {:start_child, %{id: id} = child_spec} = request <- :pg.which_groups(scope) do
-      {assigned_node, assigned_supervisor} = assign_child(scope, id, ring)
+  defp process_requests(scope, supervisor, ring) do
+    scope
+    |> :pg.which_groups()
+    |> Enum.filter(fn
+      {:start_child, _, _} -> true
+      {:terminate_child, _, _} -> true
+      _ -> false
+    end)
+    |> Enum.sort(fn {_, _, a}, {_, _, b} ->
+      a <= b
+    end)
+    |> Enum.each(fn
+      {:start_child, %{id: _id}, _} = request ->
+        process_start_child_request(scope, supervisor, ring, request)
 
-      cond do
-        assigned_node == Node.self() ->
-          unless supervising?(scope, child_spec) do
-            do_start_child(scope, supervisor, child_spec)
-          end
+      {:terminate_child, _id, _} = request ->
+        process_terminate_child_request(scope, supervisor, ring, request)
+    end)
+  end
 
-          complete_request(scope, request)
+  defp process_start_child_request(scope, supervisor, ring, request) do
+    {:start_child, %{id: id} = child_spec, _} = request
+    {assigned_node, assigned_supervisor} = assign_child(scope, id, ring)
 
-        tracks_spec?(scope, child_spec, assigned_supervisor) ->
-          complete_request(scope, request)
+    cond do
+      assigned_node == Node.self() ->
+        unless supervising?(scope, child_spec) do
+          do_start_child(scope, supervisor, child_spec)
+        end
 
-        true ->
-          :noop
-      end
+        complete_request(scope, request)
+
+      tracks_spec?(scope, child_spec, assigned_supervisor) ->
+        complete_request(scope, request)
+
+      true ->
+        :noop
     end
   end
 
-  defp process_terminate_child_requests(scope, supervisor, ring) do
-    for {:terminate_child, id} = request <- :pg.which_groups(scope) do
-      {assigned_node, assigned_supervisor} = assign_child(scope, id, ring)
-      child_spec = get_child_spec(scope, id)
+  defp process_terminate_child_request(scope, supervisor, ring, request) do
+    {:terminate_child, id, _} = request
+    {assigned_node, assigned_supervisor} = assign_child(scope, id, ring)
+    child_spec = get_child_spec(scope, id)
 
-      cond do
-        assigned_node == Node.self() ->
-          start_terminate(scope, id)
+    cond do
+      assigned_node == Node.self() ->
+        start_terminate(scope, id)
 
-          if child_spec && supervising?(scope, child_spec) do
-            Supervisor.terminate_child(supervisor, id)
-            Supervisor.delete_child(supervisor, id)
+        if child_spec && supervising?(scope, child_spec) do
+          Supervisor.terminate_child(supervisor, id)
+          Supervisor.delete_child(supervisor, id)
 
-            untrack_supervisor(scope, child_spec)
-            untrack_spec(scope, child_spec)
-          end
+          untrack_supervisor(scope, child_spec)
+          untrack_spec(scope, child_spec)
+        end
 
-          complete_request(scope, request)
+        complete_request(scope, request)
 
-        is_nil(child_spec) || !tracks_spec?(scope, child_spec, assigned_supervisor) ->
-          # complete request only after assigned supervisor untracks the spec
-          complete_request(scope, request)
+      is_nil(child_spec) || !tracks_spec?(scope, child_spec, assigned_supervisor) ->
+        # complete request only after assigned supervisor untracks the spec
+        complete_request(scope, request)
 
-        true ->
-          :noop
-      end
+      true ->
+        :noop
     end
   end
 
@@ -270,7 +311,8 @@ defmodule Pogo.DynamicSupervisor do
           # child is assigned to current node
           # start it here, if it's not started yet and it's not being terminated
 
-          unless terminating?(scope, id) || supervising?(scope, child_spec) do
+          unless terminating?(scope, id) ||
+                   (supervising?(scope, child_spec) && alive?(scope, child_spec)) do
             do_start_child(scope, supervisor, child_spec)
           end
 
@@ -292,9 +334,15 @@ defmodule Pogo.DynamicSupervisor do
   defp do_start_child(scope, supervisor, child_spec) do
     case Supervisor.start_child(supervisor, child_spec) do
       {:ok, pid} ->
+        %{id: id} = child_spec
+
         track_supervisor(scope, child_spec)
         track_pid(scope, child_spec, pid)
         track_spec(scope, child_spec)
+
+        if {:terminating, id} in :pg.which_groups(scope) do
+          finish_terminate(scope, id)
+        end
 
       _ ->
         nil
